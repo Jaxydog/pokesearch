@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rustemon::Follow;
-use rustemon::client::{CACacheManager, RustemonClientBuilder};
+use rustemon::client::{CACacheManager, RustemonClient, RustemonClientBuilder};
 use rustemon::model::resource::{Name, NamedApiResource};
 use rustemon::model::utility::Language;
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,7 @@ macro_rules! writeln {
     };
 }
 
-async fn search(arguments: Arguments) -> Result<()> {
+async fn search(arguments: Arguments, client: RustemonClient) -> Result<()> {
     #[inline]
     fn linear_find<T, U>(list: &[T], find: impl Fn(&&T) -> bool, map: impl Copy + FnOnce(&T) -> &U) -> &U {
         list.iter().find(find).map_or_else(|| map(&list[0]), |v| map(v))
@@ -97,13 +97,6 @@ async fn search(arguments: Arguments) -> Result<()> {
 
     let Command::Search { kind, name } = arguments.command else { unreachable!() };
     let api_name = name.replace(' ', "-").to_lowercase();
-    let mut manager = CACacheManager::default();
-
-    if let Some(dir) = arguments.config.cache_dir {
-        manager.path = dir.to_path_buf();
-    }
-
-    let client = RustemonClientBuilder::default().with_manager(manager).try_build()?;
     let mut stdout = tokio::io::stdout();
 
     match kind {
@@ -215,14 +208,25 @@ async fn search(arguments: Arguments) -> Result<()> {
 
 fn main() -> Result<()> {
     #[inline]
-    fn run<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(future)
+    fn run<T, F>(cache_manager: CACacheManager, future: impl FnOnce(RustemonClient) -> F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let client = RustemonClientBuilder::default().with_manager(cache_manager).try_build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+
+        runtime.block_on(future(client))
     }
 
     let arguments = Arguments::parse();
+    let mut cache_manager = CACacheManager::default();
+
+    if let Some(ref dir) = arguments.config.cache_dir {
+        cache_manager.path = dir.to_path_buf();
+    }
 
     match arguments.command {
         Command::SaveConfig { .. } => self::save_config(arguments),
-        Command::Search { .. } => run(self::search(arguments)),
+        Command::Search { .. } => run(cache_manager, |c| self::search(arguments, c)),
     }
 }
