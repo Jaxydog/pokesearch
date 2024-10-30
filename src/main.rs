@@ -121,10 +121,21 @@ async fn search(arguments: Arguments) -> Result<()> {
 
             writeln!(stdout, "{move_name} ({move_gen})").await?;
 
+            let move_class = r#move.damage_class.follow(&client).await?;
+            let move_class = english(&move_class.names);
+            let move_class = move_class
+                .chars()
+                .take(1)
+                .map(|c| c.to_ascii_uppercase())
+                .chain(move_class.chars().skip(1))
+                .collect::<String>();
+
+            writeln!(stdout, "\nClass: {move_class}").await?;
+
             let move_type = r#move.type_.follow(&client).await?;
             let move_type = english(&move_type.names);
 
-            writeln!(stdout, "\nType: {move_type}").await?;
+            writeln!(stdout, "Type: {move_type}").await?;
 
             if let Some(move_pp) = r#move.pp {
                 writeln!(stdout, "PP: {move_pp}").await?;
@@ -148,6 +159,10 @@ async fn search(arguments: Arguments) -> Result<()> {
                 writeln!(stdout, "Priority: {}", r#move.priority).await?;
             }
 
+            let move_target = r#move.target.follow(&client).await?;
+            let move_target = english(&move_target.names);
+
+            writeln!(stdout, "Target: {move_target}").await?;
             writeln!(stdout, "\n---\n\n{move_effect}").await?;
         }
         SearchType::Ability => {
