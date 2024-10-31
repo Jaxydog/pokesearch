@@ -9,7 +9,7 @@ pub struct Arguments {
     /// The search text.
     pub text: Box<str>,
     /// The cache directory.
-    #[arg(long = "cache-dir", default_value = ".config")]
+    #[arg(long = "cache-dir", default_value = ".cache")]
     pub cache_dir: Box<str>,
 }
 
