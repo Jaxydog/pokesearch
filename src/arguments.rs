@@ -8,6 +8,9 @@ pub struct Arguments {
     pub kind: SearchKind,
     /// The search text.
     pub text: Box<str>,
+    /// The cache directory.
+    #[arg(long = "cache-dir", default_value = ".config")]
+    pub cache_dir: Box<str>,
 }
 
 #[non_exhaustive]

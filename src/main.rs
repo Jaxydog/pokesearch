@@ -14,8 +14,7 @@ mod utility;
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let manager = CACacheManager { path: ".cache".into() };
-
+    let manager = CACacheManager { path: (&*arguments.cache_dir).into() };
     let client = RustemonClientBuilder::default().with_manager(manager).try_build()?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
