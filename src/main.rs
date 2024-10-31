@@ -1,232 +1,195 @@
+use std::collections::HashMap;
+use std::error::Error;
 use std::future::Future;
-use std::path::Path;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use arguments::{Arguments, SearchKind};
+use clap::Parser;
 use rustemon::Follow;
 use rustemon::client::{CACacheManager, RustemonClient, RustemonClientBuilder};
-use rustemon::model::resource::{Name, NamedApiResource};
-use rustemon::model::utility::Language;
-use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use utility::{english_search, english_search_by};
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Parser)]
-#[command(about, author, version, long_about = None)]
-struct Config {
-    /// The directory within which to cache data.
-    #[arg(long = "cache-dir", default_value = ".cache")]
-    cache_dir: Option<Box<Path>>,
+mod arguments;
+mod utility;
+
+fn main() -> Result<()> {
+    let arguments = Arguments::parse();
+    let manager = CACacheManager { path: ".cache".into() };
+
+    let client = RustemonClientBuilder::default().with_manager(manager).try_build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+
+    runtime.block_on(self::async_main(&arguments, client))
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Parser)]
-struct Arguments {
-    #[command(flatten)]
-    config: Config,
-    #[command(subcommand)]
-    command: Command,
+async fn async_main(arguments: &Arguments, client: RustemonClient) -> Result<()> {
+    let api_text = arguments.text.replace(' ', "-").to_lowercase();
+
+    match arguments.kind {
+        SearchKind::Pokemon => self::run_pokemon(arguments, client, &api_text).await,
+        SearchKind::Ability => self::run_ability(arguments, client, &api_text).await,
+        SearchKind::Move => self::run_move(arguments, client, &api_text).await,
+        SearchKind::Item => self::run_item(arguments, client, &api_text).await,
+    }
 }
 
-#[non_exhaustive]
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Subcommand)]
-#[command(about, author, long_about = None)]
-enum Command {
-    /// Saves the command's arguments to a file.
-    SaveConfig {
-        /// The output file.
-        #[arg(default_value = concat!(env!("CARGO_PKG_NAME"), ".toml"))]
-        path: Box<Path>,
-    },
-    /// Searches for the given data.
-    Search {
-        /// The search type.
-        kind: SearchType,
-        /// The search string.
-        name: Box<str>,
-    },
+#[inline]
+async fn search<T, E: Error>(name: &'static str, text: &str, future: impl Future<Output = Result<T, E>>) -> Result<T> {
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) => bail!("failed to resolve {name} '{text}' - {error}"),
+    }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, ValueEnum)]
-enum SearchType {
-    Pokemon,
-    Ability,
-    Move,
-    Item,
-}
+async fn run_pokemon(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
+    let pokemon =
+        self::search("pokemon", &arguments.text, rustemon::pokemon::pokemon::get_by_name(api_text, &client)).await?;
 
-fn save_config(arguments: Arguments) -> Result<()> {
-    let Command::SaveConfig { path } = arguments.command else { unreachable!() };
-    let content = toml::to_string_pretty(&arguments.config)?;
+    let species = pokemon.species.follow(&client).await?;
+    let species_name = &english_search(&species.names)?.name;
+    let species_generation = english_search(&species.generation.follow(&client).await?.names)?.name.to_owned();
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    async_println!("{species_name} ({species_generation})\n").await?;
+
+    let mut pokemon_types = pokemon.types.clone();
+    let mut pokemon_type_names = Vec::with_capacity(pokemon_types.len());
+
+    pokemon_types.sort_unstable_by_key(|v| v.slot);
+
+    let mut type_matchup = HashMap::<i64, (String, f64)>::new();
+
+    for type_ in rustemon::pokemon::type_::get_all_entries(&client).await? {
+        let type_ = type_.follow(&client).await?;
+        let type_name = english_search(&type_.names)?.name.to_owned();
+
+        type_matchup.insert(type_.id, (type_name, 1.0));
     }
 
-    std::fs::write(path, content).map_err(Into::into)
-}
+    for type_ in &pokemon_types {
+        let type_ = type_.type_.follow(&client).await?;
 
-macro_rules! write {
-    ($buffer:expr, $($args:tt)+) => {
-        $buffer.write_all(format!($($args)+).as_bytes())
-    };
-}
+        pokemon_type_names.push(english_search(&type_.names)?.name.to_owned());
 
-macro_rules! writeln {
-    ($buffer:expr, $($args:tt)+) => {
-        async {
-            $buffer.write_all(format!($($args)+).as_bytes()).await?;
-            $buffer.write_u8(b'\n').await
+        for type_ in type_.damage_relations.no_damage_from {
+            let type_ = type_.follow(&client).await?;
+
+            type_matchup.entry(type_.id).and_modify(|(_, v)| *v = 0.0);
         }
-    };
-}
+        for type_ in type_.damage_relations.double_damage_from {
+            let type_ = type_.follow(&client).await?;
 
-async fn search(arguments: Arguments, client: RustemonClient) -> Result<()> {
-    #[inline]
-    fn linear_find<T, U>(list: &[T], find: impl Fn(&&T) -> bool, map: impl Copy + FnOnce(&T) -> &U) -> &U {
-        list.iter().find(find).map_or_else(|| map(&list[0]), |v| map(v))
+            type_matchup.entry(type_.id).and_modify(|(_, v)| *v *= 2.0);
+        }
+        for type_ in type_.damage_relations.half_damage_from {
+            let type_ = type_.follow(&client).await?;
+
+            type_matchup.entry(type_.id).and_modify(|(_, v)| *v /= 2.0);
+        }
     }
 
-    #[inline]
-    fn english(list: &[Name]) -> &str {
-        linear_find(list, |v| v.language.name == "en", |v| &v.name)
-    }
+    async_println!("Types:\t{}", pokemon_type_names.join(", ")).await?;
 
-    #[inline]
-    fn english_by<T>(list: &[T], map: impl Fn(&T) -> &NamedApiResource<Language>) -> &T {
-        linear_find(list, |v| map(v).name == "en", |v| v)
-    }
+    let pokemon_weight = pokemon.weight as f64 / 10.0;
 
-    let Command::Search { kind, name } = arguments.command else { unreachable!() };
-    let api_name = name.replace(' ', "-").to_lowercase();
-    let mut stdout = tokio::io::stdout();
+    async_println!("Weight:\t{pokemon_weight} kg\n").await?;
 
-    match kind {
-        SearchType::Pokemon => todo!(),
-        SearchType::Move => {
-            let r#move = match rustemon::moves::move_::get_by_name(&api_name, &client).await {
-                Ok(r#move) => r#move,
-                Err(error) => bail!("failed to resolve move '{name}' - {error}"),
-            };
+    let type_matchup = type_matchup.iter().fold(HashMap::<u16, Vec<&str>>::new(), |mut map, (_, (name, mult))| {
+        let multiplier = (*mult * 100.0).round() as u16;
 
-            let move_name = english(&r#move.names);
-            let move_gen = r#move.generation.follow(&client).await?;
-            let move_gen = english(&move_gen.names);
-            let move_effect = &english_by(&r#move.effect_entries, |v| &v.language).effect;
+        map.entry(multiplier).or_default().push(name);
 
-            writeln!(stdout, "{move_name} ({move_gen})").await?;
+        map
+    });
 
-            let move_class = r#move.damage_class.follow(&client).await?;
-            let move_class = english(&move_class.names);
-            let move_class = move_class
-                .chars()
-                .take(1)
-                .map(|c| c.to_ascii_uppercase())
-                .chain(move_class.chars().skip(1))
-                .collect::<String>();
+    let mut type_matchup = type_matchup.into_iter().collect::<Box<[_]>>();
 
-            writeln!(stdout, "\nClass: {move_class}").await?;
+    type_matchup.sort_unstable_by_key(|v| v.0);
+    type_matchup.reverse();
 
-            let move_type = r#move.type_.follow(&client).await?;
-            let move_type = english(&move_type.names);
+    for (multiplier, mut type_list) in type_matchup {
+        type_list.dedup();
+        type_list.sort_unstable();
 
-            writeln!(stdout, "Type: {move_type}").await?;
+        let multiplier = multiplier as f64 / 100.0;
 
-            if let Some(move_pp) = r#move.pp {
-                writeln!(stdout, "PP: {move_pp}").await?;
-            } else {
-                writeln!(stdout, "PP: --").await?;
-            }
-
-            if let Some(move_power) = r#move.power {
-                writeln!(stdout, "Power: {move_power}").await?;
-            } else {
-                writeln!(stdout, "Power: --").await?;
-            }
-
-            if let Some(move_accuracy) = r#move.accuracy {
-                writeln!(stdout, "Accuracy: {move_accuracy}%").await?;
-            } else {
-                writeln!(stdout, "Accuracy: --").await?;
-            }
-
-            if r#move.priority != 0 {
-                writeln!(stdout, "Priority: {}", r#move.priority).await?;
-            }
-
-            let move_target = r#move.target.follow(&client).await?;
-            let move_target = english(&move_target.names);
-
-            writeln!(stdout, "Target: {move_target}").await?;
-            writeln!(stdout, "\n---\n\n{move_effect}").await?;
-        }
-        SearchType::Ability => {
-            let ability = match rustemon::pokemon::ability::get_by_name(&api_name, &client).await {
-                Ok(ability) => ability,
-                Err(error) => bail!("failed to resolve ability '{name}' - {error}"),
-            };
-
-            let ability_name = english(&ability.names);
-            let ability_effect = &english_by(&ability.effect_entries, |v| &v.language).effect;
-            let ability_gen = ability.generation.follow(&client).await?;
-            let ability_gen = english(&ability_gen.names);
-
-            writeln!(stdout, "{ability_name} ({ability_gen})\n\n---\n\n{ability_effect}").await?;
-        }
-        SearchType::Item => {
-            let item = match rustemon::items::item::get_by_name(&api_name, &client).await {
-                Ok(item) => item,
-                Err(error) => bail!("failed to resolve item '{name}' - {error}"),
-            };
-
-            let item_name = english(&item.names);
-            let item_category = item.category.follow(&client).await?;
-            let item_category = english(&item_category.names);
-
-            writeln!(stdout, "{item_name} ({item_category})\n\n---\n").await?;
-
-            if let Some(effect) = item.fling_effect {
-                let effect = effect.follow(&client).await?;
-
-                write!(stdout, "Thrown with fling").await?;
-
-                if let Some(power) = item.fling_power {
-                    write!(stdout, " ({power} power)").await?;
-                }
-
-                let effect = &english_by(&effect.effect_entries, |v| &v.language).effect;
-
-                writeln!(stdout, "\n:   {effect}\n").await?;
-            }
-
-            let item_effect = &english_by(&item.effect_entries, |v| &v.language).effect;
-
-            writeln!(stdout, "{item_effect}").await?;
-        }
+        async_println!("×{multiplier}\t{}", type_list.join(", ")).await?;
     }
 
     Ok(())
 }
 
-fn main() -> Result<()> {
-    #[inline]
-    fn run<T, F>(cache_manager: CACacheManager, future: impl FnOnce(RustemonClient) -> F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        let client = RustemonClientBuilder::default().with_manager(cache_manager).try_build()?;
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+async fn run_ability(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
+    let ability =
+        self::search("ability", &arguments.text, rustemon::pokemon::ability::get_by_name(api_text, &client)).await?;
 
-        runtime.block_on(future(client))
+    let ability_name = &english_search(&ability.names)?.name;
+    let ability_generation = english_search(&ability.generation.follow(&client).await?.names)?.name.to_owned();
+    let ability_effect = &english_search_by(&ability.effect_entries, |v| &v.language)?.effect;
+
+    async_println!("{ability_name} ({ability_generation})\n\n---\n\n{ability_effect}").await.map_err(Into::into)
+}
+
+async fn run_move(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
+    let move_ = self::search("move", &arguments.text, rustemon::moves::move_::get_by_name(api_text, &client)).await?;
+
+    let move_name = &english_search(&move_.names)?.name;
+    let move_generation = english_search(&move_.generation.follow(&client).await?.names)?.name.to_owned();
+
+    async_println!("{move_name} ({move_generation})\n").await?;
+
+    let move_class = english_search(&move_.damage_class.follow(&client).await?.names)?.name.to_owned();
+    let move_class = move_class.chars().take(1).map(|c| c.to_ascii_uppercase()).chain(move_class.chars().skip(1));
+
+    async_println!("Class:\t\t{}", move_class.collect::<Box<str>>()).await?;
+
+    let move_type = english_search(&move_.type_.follow(&client).await?.names)?.name.to_owned();
+
+    async_println!("Type:\t\t{move_type}").await?;
+
+    if let Some(move_pp) = move_.pp {
+        async_println!("PP:\t\t{move_pp}").await?;
+    } else {
+        async_println!("PP:\t\t-").await?;
     }
 
-    let arguments = Arguments::parse();
-    let mut cache_manager = CACacheManager::default();
-
-    if let Some(ref dir) = arguments.config.cache_dir {
-        cache_manager.path = dir.to_path_buf();
+    if let Some(move_power) = move_.power {
+        async_println!("Power:\t\t{move_power}").await?;
+    } else {
+        async_println!("Power:\t\t-").await?;
     }
 
-    match arguments.command {
-        Command::SaveConfig { .. } => self::save_config(arguments),
-        Command::Search { .. } => run(cache_manager, |c| self::search(arguments, c)),
+    if let Some(move_accuracy) = move_.accuracy {
+        async_println!("Accuracy:\t{move_accuracy}").await?;
+    } else {
+        async_println!("Accuracy:\t-").await?;
     }
+
+    if move_.priority != 0 {
+        async_println!("Priority:\t{}", move_.priority).await?;
+    }
+
+    let move_target = english_search(&move_.target.follow(&client).await?.names)?.name.to_owned();
+    let move_effect = &english_search_by(&move_.effect_entries, |v| &v.language)?.effect;
+
+    async_println!("Target: {move_target}\n\n---\n\n{move_effect}").await.map_err(Into::into)
+}
+
+async fn run_item(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
+    let item = self::search("item", &arguments.text, rustemon::items::item::get_by_name(api_text, &client)).await?;
+
+    let item_name = &english_search(&item.names)?.name;
+    let item_category = english_search(&item.category.follow(&client).await?.names)?.name.to_owned();
+
+    async_println!("{item_name} ({item_category})\n\n---\n").await?;
+
+    if let Some((item_fling_effect, item_fling_power)) = item.fling_effect.zip(item.fling_power) {
+        let item_fling_effect = item_fling_effect.follow(&client).await?.effect_entries;
+        let item_fling_effect = &english_search_by(&item_fling_effect, |v| &v.language)?.effect;
+
+        async_println!("Thrown with fling ({item_fling_power} power)\n:   {item_fling_effect}\n").await?;
+    }
+
+    let item_effect = &english_search_by(&item.effect_entries, |v| &v.language)?.effect;
+
+    async_println!("{item_effect}").await.map_err(Into::into)
 }
