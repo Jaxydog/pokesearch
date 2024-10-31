@@ -170,7 +170,7 @@ async fn run_move(arguments: &Arguments, client: RustemonClient, api_text: &str)
     let move_target = english_search(&move_.target.follow(&client).await?.names)?.name.to_owned();
     let move_effect = &english_search_by(&move_.effect_entries, |v| &v.language)?.effect;
 
-    async_println!("Target: {move_target}\n\n---\n\n{move_effect}").await.map_err(Into::into)
+    async_println!("Target:\t\t{move_target}\n\n---\n\n{move_effect}").await.map_err(Into::into)
 }
 
 async fn run_item(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
