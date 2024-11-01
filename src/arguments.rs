@@ -20,4 +20,5 @@ pub enum SearchKind {
     Ability,
     Move,
     Item,
+    Type,
 }

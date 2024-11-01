@@ -7,7 +7,7 @@ use arguments::{Arguments, SearchKind};
 use clap::Parser;
 use rustemon::Follow;
 use rustemon::client::{CACacheManager, RustemonClient, RustemonClientBuilder};
-use utility::{english_search, english_search_by};
+use utility::{TypeMatchup, english_search, english_search_by};
 
 mod arguments;
 mod utility;
@@ -29,6 +29,7 @@ async fn async_main(arguments: &Arguments, client: RustemonClient) -> Result<()>
         SearchKind::Ability => self::run_ability(arguments, client, &api_text).await,
         SearchKind::Move => self::run_move(arguments, client, &api_text).await,
         SearchKind::Item => self::run_item(arguments, client, &api_text).await,
+        SearchKind::Type => self::run_type(arguments, client, &api_text).await,
     }
 }
 
@@ -55,35 +56,14 @@ async fn run_pokemon(arguments: &Arguments, client: RustemonClient, api_text: &s
 
     pokemon_types.sort_unstable_by_key(|v| v.slot);
 
-    let mut type_matchup = HashMap::<i64, (String, f64)>::new();
-
-    for type_ in rustemon::pokemon::type_::get_all_entries(&client).await? {
-        let type_ = type_.follow(&client).await?;
-        let type_name = english_search(&type_.names)?.name.to_owned();
-
-        type_matchup.insert(type_.id, (type_name, 1.0));
-    }
+    let mut matchup = TypeMatchup::new(&client).await?;
 
     for type_ in &pokemon_types {
         let type_ = type_.type_.follow(&client).await?;
 
         pokemon_type_names.push(english_search(&type_.names)?.name.to_owned());
 
-        for type_ in type_.damage_relations.no_damage_from {
-            let type_ = type_.follow(&client).await?;
-
-            type_matchup.entry(type_.id).and_modify(|(_, v)| *v = 0.0);
-        }
-        for type_ in type_.damage_relations.double_damage_from {
-            let type_ = type_.follow(&client).await?;
-
-            type_matchup.entry(type_.id).and_modify(|(_, v)| *v *= 2.0);
-        }
-        for type_ in type_.damage_relations.half_damage_from {
-            let type_ = type_.follow(&client).await?;
-
-            type_matchup.entry(type_.id).and_modify(|(_, v)| *v /= 2.0);
-        }
+        matchup.apply_relations(&type_.damage_relations).await?;
     }
 
     async_println!("Types:\t{}", pokemon_type_names.join(", ")).await?;
@@ -92,29 +72,7 @@ async fn run_pokemon(arguments: &Arguments, client: RustemonClient, api_text: &s
 
     async_println!("Weight:\t{pokemon_weight} kg\n").await?;
 
-    let type_matchup = type_matchup.iter().fold(HashMap::<u16, Vec<&str>>::new(), |mut map, (_, (name, mult))| {
-        let multiplier = (*mult * 100.0).round() as u16;
-
-        map.entry(multiplier).or_default().push(name);
-
-        map
-    });
-
-    let mut type_matchup = type_matchup.into_iter().collect::<Box<[_]>>();
-
-    type_matchup.sort_unstable_by_key(|v| v.0);
-    type_matchup.reverse();
-
-    for (multiplier, mut type_list) in type_matchup {
-        type_list.dedup();
-        type_list.sort_unstable();
-
-        let multiplier = multiplier as f64 / 100.0;
-
-        async_println!("×{multiplier}\t{}", type_list.join(", ")).await?;
-    }
-
-    Ok(())
+    matchup.print().await
 }
 
 async fn run_ability(arguments: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
@@ -191,4 +149,17 @@ async fn run_item(arguments: &Arguments, client: RustemonClient, api_text: &str)
     let item_effect = &english_search_by(&item.effect_entries, |v| &v.language)?.effect;
 
     async_println!("{item_effect}").await.map_err(Into::into)
+}
+
+async fn run_type(_: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
+    let types = api_text.split(',').collect::<Box<[_]>>();
+    let mut matchup = TypeMatchup::new(&client).await?;
+
+    for type_ in &types {
+        let type_ = self::search("type", type_, rustemon::pokemon::type_::get_by_name(type_, &client)).await?;
+
+        matchup.apply_relations(&type_.damage_relations).await?;
+    }
+
+    matchup.print().await
 }
