@@ -151,8 +151,10 @@ async fn run_item(arguments: &Arguments, client: RustemonClient, api_text: &str)
 }
 
 async fn run_type(_: &Arguments, client: RustemonClient, api_text: &str) -> Result<()> {
-    let types = api_text.split(',').collect::<Box<[_]>>();
+    let mut types = api_text.split(',').collect::<Vec<_>>();
     let mut matchup = TypeMatchup::new(&client).await?;
+
+    types.dedup();
 
     for type_ in &types {
         let type_ = self::search("type", type_, rustemon::pokemon::type_::get_by_name(type_, &client)).await?;
