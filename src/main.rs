@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let manager = CACacheManager { path: (&*arguments.cache_dir).into() };
     let client = RustemonClientBuilder::default().with_manager(manager).try_build()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
     runtime.block_on(self::async_main(&arguments, client))
 }
